@@ -8,7 +8,7 @@ l2: {size_kib: 256, ways: 8, latency: 14}
 llc: {size_kib: 2048, ways: 16, latency: 34}
 dram_latency: 200
 peak_bw_gbps: 12.8
-pf_backlog_factor: 4
+pf_backlog_factor: 32
 bw_window_cycles: 4096
 bw_bucket_cycles: 64
 pf_same_page_only: true
@@ -21,4 +21,3 @@ stats_interval: 50000
 acc_ema_weight: 0.015625
 pol_ema_weight: 0.015625
 pollution: {counterfactual: true}
-

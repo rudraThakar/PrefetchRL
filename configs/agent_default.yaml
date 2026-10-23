@@ -1,3 +1,4 @@
+tuning_status: provisional
 alpha: 0.05
 gamma: 0.6
 eps_0: 0.12
@@ -12,11 +13,13 @@ explore: true
 explore_mode: eps_decay
 history_size: 8192
 reaches: [1, 2, 4, 8, 16]
-patterns: [P1, P2, P4, M1, PC_D1, PC_D2, PAGE_D1]
+patterns: [P1, P2, P4, M1, PC_D1, PAGE_D1]
 feature_drop: []
 reward_pollution: true
 reward_bw_term: true
 reward_graded: true
+admission_control: false
+reach_control: false
 reward:
   c_use: 1.0
   t_min: 0.2

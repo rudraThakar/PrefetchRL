@@ -1,0 +1,49 @@
+tuning_status: provisional
+alpha: 0.00963744635860539
+gamma: 0.8997089791460796
+eps_0: 0.05590810716794402
+eps_min: 0.01
+half_life: 66891
+q0: 0.16896809586035746
+delta_max: 2.0
+pc_bits: 6
+double_q: true
+learn: true
+explore: true
+explore_mode: eps_decay
+history_size: 8192
+reaches:
+- 1
+- 2
+- 4
+- 8
+- 16
+patterns:
+- P1
+- P2
+- P4
+- M1
+- PC_D1
+- PAGE_D1
+feature_drop: []
+reward_pollution: true
+reward_bw_term: true
+reward_graded: true
+admission_control: false
+admission_min_feedback: 4096
+admission_min_accuracy: 0.15
+admission_probe_interval: 64
+reach_control: false
+reach_min_feedback: 256
+reach_min_accuracy: 0.5
+low_accuracy_max_reach: 2
+miss_lat_ref: 254.0
+reward:
+  c_use: 1.0
+  t_min: 0.31046773260002475
+  c_w0: 0.48710607881543744
+  c_w1: 1.4584644009640337
+  c_red: 0.05
+  c_drop: 0.1
+  c_none_miss: 0.05
+  c_pol: 1.0883954263166766

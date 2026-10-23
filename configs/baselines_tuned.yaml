@@ -1,5 +1,8 @@
-# Defaults pending the M5 development-workload grid search.
-next_line: {degree: 2}
-stride_pc: {degree: 4, min_conf: 2}
-bop: {degree: 1, roundmax: 100}
-
+next_line:
+  degree: 1
+stride_pc:
+  degree: 2
+  min_conf: 2
+bop:
+  degree: 1
+  roundmax: 200
