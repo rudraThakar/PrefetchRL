@@ -41,7 +41,7 @@ class QTableSmallPrefetcher:
         self.q = np.full((N_STATES, N_ACTIONS), self.q0, dtype=np.float32)
         self.pc_table: list[tuple[int, int, int, int] | None] = [None] * 1024
         self.decisions: dict[int, _SmallDecision] = {}; self.order: deque[int] = deque()
-        self.previous = None; self.next_id = self.updates = 0; self.reward_sum = 0.0
+        self.previous = None; self.next_id = self.updates = 0; self.reward_sum = 0.0; self.reward_count = 0
         self.action_counts = np.zeros(N_ACTIONS, dtype=np.int64)
 
     def _context(self, ev: DemandEvent) -> tuple[int, int, int]:
@@ -72,7 +72,7 @@ class QTableSmallPrefetcher:
             choices = np.flatnonzero(decision.next_valid)
             target += self.gamma * float(self.q[decision.next_state, choices].max())
         self.q[decision.state, decision.action] += self.alpha * (target - self.q[decision.state, decision.action])
-        decision.updated = True; self.updates += 1; self.reward_sum += decision.reward
+        decision.updated = True; self.updates += 1; self.reward_sum += decision.reward; self.reward_count += 1
 
     def on_demand(self, ev: DemandEvent) -> list[PrefetchRequest]:
         state, d1, _ = self._context(ev); valid = self._valid(ev.line, d1)
@@ -105,7 +105,13 @@ class QTableSmallPrefetcher:
         return N_STATES * N_ACTIONS * 16 + 1024 * (16 + 32 + 22)
 
     def stats(self) -> dict[str, Any]:
-        return {"mean_reward": self.reward_sum / self.updates if self.updates else 0.0,
+        return {"mean_reward": self.reward_sum / self.reward_count if self.reward_count else 0.0,
+                "reward_sum": self.reward_sum, "reward_count": self.reward_count,
                 "epsilon": self.epsilon, "updates": self.updates,
                 "action_counts": self.action_counts.tolist()}
 
+
+def from_agent_config(config, miss_lat_ref: float) -> QTableSmallPrefetcher:
+    """Construct the small control with the main agent's tuned learning/reward values."""
+    return QTableSmallPrefetcher(alpha=config.alpha, gamma=config.gamma, epsilon=config.eps_min,
+                                 q0=config.q0, miss_lat_ref=miss_lat_ref, reward=config.reward)

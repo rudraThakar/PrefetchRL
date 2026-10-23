@@ -8,6 +8,8 @@ from .format import Trace, validate
 
 SYNTHETIC_DEFAULT = 2_000_000
 KERNEL_DEFAULT = 4_000_000
+WORKLOAD_DEFAULTS = {"matmul_blocked": 10_500_000, "stencil2d": 5_500_000}
+DEFAULT_GAP_MEAN = 64.0
 BASE_PC = np.uint64(0x400000)
 ARRAY_BASE = np.uint64(1 << 32)
 
@@ -23,22 +25,26 @@ KERNELS = {"matmul_blocked", "spmv_csr", "bfs_graph", "stencil2d"}
 def _finish(name: str, seed: int, lines: np.ndarray, sites: np.ndarray,
             rng: np.random.Generator, *, arrays: np.ndarray | None = None,
             writes: np.ndarray | None = None, dep: np.ndarray | None = None,
-            byte_offsets: np.ndarray | None = None, meta: dict | None = None) -> Trace:
+            byte_offsets: np.ndarray | None = None, meta: dict | None = None,
+            gap_mean: float = DEFAULT_GAP_MEAN) -> Trace:
     n = len(lines)
     arrays = np.zeros(n, dtype=np.uint64) if arrays is None else arrays.astype(np.uint64)
     byte_offsets = np.zeros(n, dtype=np.uint64) if byte_offsets is None else byte_offsets.astype(np.uint64)
     addr = (arrays + 1) * ARRAY_BASE + lines.astype(np.uint64) * np.uint64(64) + byte_offsets
     pc = BASE_PC + sites.astype(np.uint64) * np.uint64(0x40)
-    gaps = np.minimum(rng.geometric(1 / 5, n) - 1, np.iinfo(np.uint16).max).astype(np.uint16)
+    if gap_mean < 0: raise ValueError("gap_mean must be non-negative")
+    gaps = np.minimum(rng.geometric(1 / (gap_mean + 1), n) - 1,
+                      np.iinfo(np.uint16).max).astype(np.uint16)
     trace = Trace(pc, addr, gaps,
                   np.zeros(n, dtype=np.uint8) if writes is None else writes.astype(np.uint8),
                   np.zeros(n, dtype=np.uint8) if dep is None else dep.astype(np.uint8),
-                  {"workload": name, "seed": seed, "record_count": n, **(meta or {})})
+                  {"workload": name, "seed": seed, "record_count": n,
+                   "gap_mean": gap_mean, **(meta or {})})
     validate(trace)
     return trace
 
 
-def _simple(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
+def _simple(name: str, seed: int, n: int, rng: np.random.Generator, gap_mean: float) -> Trace:
     idx = np.arange(n, dtype=np.int64)
     sites = np.zeros(n, dtype=np.uint8)
     if name == "seq_stream":
@@ -52,19 +58,19 @@ def _simple(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
         m = idx >> 2
         strides = np.array([1, 3, 7, -2], dtype=np.int64)
         lines = (m * strides[sites]) % (1 << 19)
-        return _finish(name, seed, lines, sites, rng, arrays=sites)
+        return _finish(name, seed, lines, sites, rng, arrays=sites, gap_mean=gap_mean)
     elif name == "mix_reg_irr":
         sites = (idx & 1).astype(np.uint8)
         lines = np.where(sites == 0, (idx >> 1) % (1 << 20),
                          rng.integers(0, 1 << 20, n, dtype=np.int64))
-        return _finish(name, seed, lines, sites, rng, arrays=sites)
+        return _finish(name, seed, lines, sites, rng, arrays=sites, gap_mean=gap_mean)
     else:
         raise KeyError(name)
-    return _finish(name, seed, lines, sites, rng)
+    return _finish(name, seed, lines, sites, rng, gap_mean=gap_mean)
 
 
 def _phase(name: str, seed: int, n: int, rng: np.random.Generator,
-           phase_len: int, gradual: bool) -> Trace:
+           phase_len: int, gradual: bool, gap_mean: float) -> Trace:
     idx = np.arange(n, dtype=np.int64)
     phase = idx // phase_len
     pos = idx % phase_len
@@ -98,11 +104,11 @@ def _phase(name: str, seed: int, n: int, rng: np.random.Generator,
     boundaries = list(range(phase_len, n, phase_len))
     return _finish(name, seed, lines, sites, rng,
                    meta={"phase_len": phase_len, "transition": "gradual" if gradual else "abrupt",
-                         "boundaries": boundaries})
+                         "boundaries": boundaries}, gap_mean=gap_mean)
 
 
 def _list_walk(name: str, seed: int, n: int, rng: np.random.Generator,
-               p_seq: float = 0.5) -> Trace:
+               p_seq: float = 0.5, gap_mean: float = DEFAULT_GAP_MEAN) -> Trace:
     lines = np.empty(n, dtype=np.int64)
     cur = 0
     for start in range(0, n, 65536):
@@ -115,10 +121,10 @@ def _list_walk(name: str, seed: int, n: int, rng: np.random.Generator,
             cur = (cur + 1) % (1 << 20) if sequential[local] else int(random_next[local])
     dep = np.ones(n, dtype=np.uint8)
     if n: dep[0] = 0
-    return _finish(name, seed, lines, np.zeros(n, dtype=np.uint8), rng, dep=dep)
+    return _finish(name, seed, lines, np.zeros(n, dtype=np.uint8), rng, dep=dep, gap_mean=gap_mean)
 
 
-def _ptr_chase(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
+def _ptr_chase(name: str, seed: int, n: int, rng: np.random.Generator, gap_mean: float) -> Trace:
     size = 1 << 18
     perm = np.arange(size, dtype=np.int64)
     # Sattolo's algorithm: exactly one cycle.
@@ -133,10 +139,10 @@ def _ptr_chase(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
         cur = int(perm[cur])
     lines = np.resize(cycle, n)
     return _finish(name, seed, lines, np.zeros(n, dtype=np.uint8), rng,
-                   dep=np.ones(n, dtype=np.uint8))
+                   dep=np.ones(n, dtype=np.uint8), gap_mean=gap_mean)
 
 
-def _hash(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
+def _hash(name: str, seed: int, n: int, rng: np.random.Generator, gap_mean: float) -> Trace:
     # Vectorized batches of one primary lookup followed by a geometrically sized probe chain.
     lines: list[np.ndarray] = []
     sites: list[np.ndarray] = []
@@ -154,11 +160,13 @@ def _hash(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
         sites.append((k > 0).astype(np.uint8))
         deps.append((k > 0).astype(np.uint8))
         total += len(base)
-    return _finish(name, seed, np.concatenate(lines)[:n], np.concatenate(sites)[:n], rng,
-                   dep=np.concatenate(deps)[:n])
+    buckets = np.concatenate(lines)[:n]
+    return _finish(name, seed, buckets // 8, np.concatenate(sites)[:n], rng,
+                   dep=np.concatenate(deps)[:n], byte_offsets=(buckets % 8) * 8,
+                   gap_mean=gap_mean)
 
 
-def _matmul(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
+def _matmul(name: str, seed: int, n: int, rng: np.random.Generator, gap_mean: float) -> Trace:
     """Vectorized decoding of the exact ii,jj,kk,i,k,j blocked loop nest."""
     idx = np.arange(n, dtype=np.int64)
     group, within = idx // 97, idx % 97
@@ -174,10 +182,10 @@ def _matmul(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
                np.where(sites == 1, k * 512 + j, i * 512 + j))
     arrays = np.where(sites == 0, 0, np.where(sites == 1, 1, 2))
     return _finish(name, seed, elements // 8, sites, rng, arrays=arrays,
-                   byte_offsets=(elements % 8) * 8, writes=(sites == 3))
+                   byte_offsets=(elements % 8) * 8, writes=(sites == 3), gap_mean=gap_mean)
 
 
-def _spmv(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
+def _spmv(name: str, seed: int, n: int, rng: np.random.Generator, gap_mean: float) -> Trace:
     """Generate exact CSR row event order in vectorized row batches."""
     out_lines: list[np.ndarray] = []; out_sites: list[np.ndarray] = []
     out_arrays: list[np.ndarray] = []; out_offsets: list[np.ndarray] = []
@@ -213,10 +221,10 @@ def _spmv(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
         produced += total; row += count; edge_base += int(nnz.sum())
     return _finish(name, seed, np.concatenate(out_lines)[:n], np.concatenate(out_sites)[:n], rng,
                    arrays=np.concatenate(out_arrays)[:n], byte_offsets=np.concatenate(out_offsets)[:n],
-                   dep=np.concatenate(out_dep)[:n], writes=np.concatenate(out_writes)[:n])
+                   dep=np.concatenate(out_dep)[:n], writes=np.concatenate(out_writes)[:n], gap_mean=gap_mean)
 
 
-def _bfs(name: str, seed: int, n_records: int, rng: np.random.Generator) -> Trace:
+def _bfs(name: str, seed: int, n_records: int, rng: np.random.Generator, gap_mean: float) -> Trace:
     """Build the specified random CSR graph and replay a real FIFO BFS."""
     n_vertices = 1 << 18
     degree = np.maximum(1, rng.poisson(8, n_vertices)).astype(np.int64)
@@ -298,10 +306,10 @@ def _bfs(name: str, seed: int, n_records: int, rng: np.random.Generator) -> Trac
                    byte_offsets=np.concatenate(offsets_out)[:n_records],
                    writes=np.concatenate(writes_out)[:n_records],
                    dep=np.concatenate(deps_out)[:n_records],
-                   meta={"vertices": n_vertices, "edges": int(row_ptr[-1])})
+                   meta={"vertices": n_vertices, "edges": int(row_ptr[-1])}, gap_mean=gap_mean)
 
 
-def _stencil(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
+def _stencil(name: str, seed: int, n: int, rng: np.random.Generator, gap_mean: float) -> Trace:
     idx = np.arange(n, dtype=np.int64)
     if name == "stencil2d":
         sites = (idx % 6).astype(np.uint8); cell = idx // 6
@@ -309,35 +317,37 @@ def _stencil(name: str, seed: int, n: int, rng: np.random.Generator) -> Trace:
         di = np.array([-1, 0, 0, 0, 1, 0])[sites]
         dj = np.array([0, -1, 0, 1, 0, 0])[sites]
         lines = ((i + di) * 2048 + j + dj) // 8
-        return _finish(name, seed, lines, sites, rng, arrays=(sites == 5), writes=(sites == 5))
+        return _finish(name, seed, lines, sites, rng, arrays=(sites == 5), writes=(sites == 5), gap_mean=gap_mean)
     raise KeyError(name)
 
 
 def generate(name: str, seed: int, n_records: int | None = None, **params: object) -> Trace:
     if name not in WORKLOADS:
         raise ValueError(f"unknown workload {name!r}; choose from {', '.join(WORKLOADS)}")
-    n = int(n_records if n_records is not None else (KERNEL_DEFAULT if name in KERNELS else SYNTHETIC_DEFAULT))
+    n = int(n_records if n_records is not None else WORKLOAD_DEFAULTS.get(
+        name, KERNEL_DEFAULT if name in KERNELS else SYNTHETIC_DEFAULT))
     if n < 0:
         raise ValueError("n_records must be non-negative")
     rng = np.random.default_rng(seed)
+    gap_mean = float(params.get("gap_mean", DEFAULT_GAP_MEAN))
     if name in {"seq_stream", "stride_const", "multi_stride", "random_uniform", "mix_reg_irr"}:
-        return _simple(name, seed, n, rng)
+        return _simple(name, seed, n, rng, gap_mean)
     if name == "phase_mix":
-        return _phase(name, seed, n, rng, int(params.get("phase_len", 300_000)), False)
+        return _phase(name, seed, n, rng, int(params.get("phase_len", 300_000)), False, gap_mean)
     if name == "phase_mix_fast":
-        return _phase(name, seed, n, rng, int(params.get("phase_len", 30_000)), False)
+        return _phase(name, seed, n, rng, int(params.get("phase_len", 30_000)), False, gap_mean)
     if name == "phase_mix_gradual":
-        return _phase(name, seed, n, rng, int(params.get("phase_len", 100_000)), True)
+        return _phase(name, seed, n, rng, int(params.get("phase_len", 100_000)), True, gap_mean)
     if name == "list_walk":
-        return _list_walk(name, seed, n, rng, float(params.get("p_seq", 0.5)))
+        return _list_walk(name, seed, n, rng, float(params.get("p_seq", 0.5)), gap_mean)
     if name == "ptr_chase":
-        return _ptr_chase(name, seed, n, rng)
+        return _ptr_chase(name, seed, n, rng, gap_mean)
     if name == "hash_lookup":
-        return _hash(name, seed, n, rng)
+        return _hash(name, seed, n, rng, gap_mean)
     if name == "matmul_blocked":
-        return _matmul(name, seed, n, rng)
+        return _matmul(name, seed, n, rng, gap_mean)
     if name == "spmv_csr":
-        return _spmv(name, seed, n, rng)
+        return _spmv(name, seed, n, rng, gap_mean)
     if name == "bfs_graph":
-        return _bfs(name, seed, n, rng)
-    return _stencil(name, seed, n, rng)
+        return _bfs(name, seed, n, rng, gap_mean)
+    return _stencil(name, seed, n, rng, gap_mean)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass
+import heapq
 from typing import Any
 
 from pfsim.config import SimConfig
@@ -37,6 +38,9 @@ class SimulationResult:
     avg_bw_util: float
     storage_bits: int
     returned_requests: int
+    mean_reward: float
+    action_histogram: list[int]
+    gap_mean: float
 
     @property
     def accuracy(self) -> float:
@@ -68,8 +72,13 @@ class SimulationResult:
 
 
 class Simulator:
-    def __init__(self, config: SimConfig, prefetcher: Prefetcher):
+    def __init__(self, config: SimConfig, prefetcher: Prefetcher, *, record_demand_lines: bool = False,
+                 record_boundaries: tuple[int, ...] = ()):
         self.cfg, self.prefetcher = config, prefetcher
+        if hasattr(self.prefetcher, "reference_latency"):
+            self.prefetcher.reference_latency = config.llc.latency + config.dram_latency + config.transfer_cycles
+        self.record_demand_lines = record_demand_lines
+        self.requested_boundaries = frozenset(record_boundaries)
 
     def _reset(self, seed: int):
         c = self.cfg
@@ -80,7 +89,10 @@ class Simulator:
         self.dram = DramChannel(c.dram_latency, c.transfer_cycles, c.bw_window_cycles)
         self.prefetcher.reset(seed)
         self.l2_idx = self.next_pf_id = 0
+        self._pf_inflight: dict[int, float] = {}
+        self._pf_ready_heap: list[tuple[float, int]] = []
         self.book: dict[int, dict[str, Any]] = {}
+        self.book_gc: deque[tuple[int, int]] = deque()
         self.expiry: deque[tuple[int, int]] = deque()
         self.victims: OrderedDict[int, tuple[int, int]] = OrderedDict()
         self.acc_ema = 0.5; self.pol_ema = 0.0
@@ -90,8 +102,9 @@ class Simulator:
         self.measure = False
         self.demand_lines: list[int] = []
         self.intervals: list[dict[str, Any]] = []
+        self.boundary_l2: dict[int, int] = {}
         self._interval_base = {"l2": 0, "inst": 0, "now": 0.0, "useful": 0,
-                               "useless": 0, "misses": 0}
+                               "useless": 0, "misses": 0, "reward_sum": 0.0, "reward_count": 0}
 
     def _record_interval(self, inst: int, now: float) -> None:
         c, base = self.counts, self._interval_base
@@ -100,18 +113,21 @@ class Simulator:
             return
         resolved = (c["useful"] - base["useful"]) + (c["useless"] - base["useless"])
         stats = self.prefetcher.stats()
+        reward_count = int(stats.get("reward_count", 0)) - int(base.get("reward_count", 0))
+        reward_sum = float(stats.get("reward_sum", 0.0)) - float(base.get("reward_sum", 0.0))
         self.intervals.append({
             "l2_idx": self.l2_idx,
             "l2_accesses": accesses,
             "window_ipc": (inst - base["inst"]) / (now - base["now"]) if now > base["now"] else 0.0,
             "window_accuracy": (c["useful"] - base["useful"]) / resolved if resolved else 0.0,
             "window_coverage_proxy": (c["useful"] - base["useful"]) / accesses,
-            "mean_reward": float(stats.get("mean_reward", 0.0)),
+            "mean_reward": reward_sum / reward_count if reward_count else 0.0,
             "epsilon": float(stats.get("epsilon", 0.0)),
         })
         self._interval_base = {"l2": c["l2_accesses"], "inst": inst, "now": now,
                                "useful": c["useful"], "useless": c["useless"],
-                               "misses": c["l2_misses"]}
+                               "misses": c["l2_misses"], "reward_sum": float(stats.get("reward_sum", 0.0)),
+                               "reward_count": int(stats.get("reward_count", 0))}
 
     def _emit(self, kind: OutcomeKind, tag: Any, *, pf_id: int | None = None,
               wait: float = 0, reason: str | None = None):
@@ -144,19 +160,38 @@ class Simulator:
                 if entry is not None and entry.pf_id == pf_id:
                     entry.resolved = True
                 self._emit(OutcomeKind.USELESS, info["tag"], pf_id=pf_id, reason="expired")
+        while self.book_gc and self.book_gc[0][1] <= self.l2_idx:
+            pf_id, _ = self.book_gc.popleft(); info = self.book.get(pf_id)
+            if info is not None and info.get("resolved"):
+                del self.book[pf_id]
 
     def _install_l2(self, entry: Entry, prefetch_fill: bool, pf_id: int = -1):
         victim = self.l2.install(entry.line, entry)
         if victim is None:
             return
         if victim.pf and not victim.used and not victim.resolved:
+            self._pf_inflight.pop(victim.pf_id, None)
             victim.resolved = True
             self._emit(OutcomeKind.USELESS, None, pf_id=victim.pf_id, reason="evicted")
+        elif victim.pf:
+            self._pf_inflight.pop(victim.pf_id, None)
+            if prefetch_fill and victim.used:
+                self.victims[victim.line] = (pf_id, self.l2_idx)
+                self.victims.move_to_end(victim.line)
+                while len(self.victims) > self.cfg.victim_filter_size:
+                    self.victims.popitem(last=False)
         elif prefetch_fill:
             self.victims[victim.line] = (pf_id, self.l2_idx)
             self.victims.move_to_end(victim.line)
             while len(self.victims) > self.cfg.victim_filter_size:
                 self.victims.popitem(last=False)
+
+    def _inflight_prefetches(self, now: float) -> int:
+        while self._pf_ready_heap and self._pf_ready_heap[0][0] <= now:
+            ready, pf_id = heapq.heappop(self._pf_ready_heap)
+            if self._pf_inflight.get(pf_id) == ready:
+                del self._pf_inflight[pf_id]
+        return len(self._pf_inflight)
 
     def _check_pollution(self, line: int):
         blamed = self.victims.get(line)
@@ -178,7 +213,7 @@ class Simulator:
             self._emit(OutcomeKind.DROPPED, req.tag, reason="cross_page"); return
         if self.l2.contains(line):
             self._emit(OutcomeKind.REDUNDANT, req.tag); return
-        inflight = sum(e.pf and not e.used and e.ready > now for e in self.l2.entries())
+        inflight = self._inflight_prefetches(now)
         if inflight >= self.cfg.pf_mshr:
             self._emit(OutcomeKind.DROPPED, req.tag, reason="mshr"); return
         llc_entry = self.llc.lookup(line)
@@ -192,7 +227,11 @@ class Simulator:
         pf_id = self.next_pf_id; self.next_pf_id += 1
         self.book[pf_id] = {"tag": req.tag, "line": line, "u_issue": self.dram.utilization(now),
                             "issue_idx": self.l2_idx, "measured": self.measure, "resolved": False}
+        retention = max(self.cfg.expiry_accesses, self.cfg.pollution_window) + 1
+        self.book_gc.append((pf_id, self.l2_idx + retention))
         self._install_l2(Entry(line, ready, pf=True, pf_id=pf_id), True, pf_id)
+        self._pf_inflight[pf_id] = ready
+        heapq.heappush(self._pf_ready_heap, (ready, pf_id))
         self.expiry.append((pf_id, self.l2_idx))
         if self.measure: self.counts["issued"] += 1
 
@@ -202,13 +241,15 @@ class Simulator:
         if e1 is not None:
             self.l1.touch(line)
             return self.l1.latency + max(0.0, e1.ready - now)
-        self.l2_idx += 1; self.demand_lines.append(line)
+        self.l2_idx += 1
+        if self.record_demand_lines: self.demand_lines.append(line)
         if self.measure: self.counts["l2_accesses"] += 1
         e2 = self.l2.lookup(line)
         if e2 is not None:
             wait = max(0.0, e2.ready - now); ready = now + self.l2.latency + wait
             if e2.pf and not e2.used:
                 e2.used = True
+                self._pf_inflight.pop(e2.pf_id, None)
                 if not e2.resolved:
                     e2.resolved = True; self._emit(OutcomeKind.USEFUL, None, pf_id=e2.pf_id, wait=wait)
                 elif self.measure:
@@ -228,7 +269,7 @@ class Simulator:
         if self.shadow.contains(line): self.shadow.touch(line)
         else: self.shadow.install(line, Entry(line, 0))
         self._expire()
-        inflight_pf = sum(e.pf and not e.used and e.ready > now for e in self.l2.entries())
+        inflight_pf = self._inflight_prefetches(now)
         event = DemandEvent(now, pc, line, line >> 6, line & 63, is_write,
                             e2 is not None, bool(e2 is not None and e2.pf), self.l2_idx,
                             SysState(self.dram.utilization(now), self.acc_ema, self.pol_ema,
@@ -240,19 +281,26 @@ class Simulator:
 
     def run(self, trace: Trace, seed: int = 0) -> SimulationResult:
         self._reset(seed)
-        now = 0.0; inst = 0; last_done = 0.0
+        now = 0.0; inst = 0; last_done = 0.0; stall_since_l2 = 0.0
         outstanding: deque[tuple[int, float]] = deque()
         warmup = int(len(trace) * self.cfg.warmup_fraction)
         measured_inst_start = measured_now_start = 0.0
         for index, (pc, addr, gap, wr, dep) in enumerate(zip(
                 trace.pc.tolist(), trace.addr.tolist(), trace.gap.tolist(),
                 trace.is_write.tolist(), trace.dep.tolist())):
+            if index in self.requested_boundaries:
+                self.boundary_l2[index] = self.l2_idx
             if index == warmup:
                 self.measure = True; measured_inst_start = inst; measured_now_start = now
+                start_measurement = getattr(self.prefetcher, "start_measurement", None)
+                if start_measurement is not None: start_measurement()
                 self.dram.total_busy = 0.0
                 self.dram.reads = {"demand": 0, "prefetch": 0}
+                stats = self.prefetcher.stats()
                 self._interval_base = {"l2": 0, "inst": inst, "now": now, "useful": 0,
-                                       "useless": 0, "misses": 0}
+                                       "useless": 0, "misses": 0,
+                                       "reward_sum": float(stats.get("reward_sum", 0.0)),
+                                       "reward_count": int(stats.get("reward_count", 0))}
             before_stall = now
             now += (gap + 1) / self.cfg.width; inst += gap + 1
             if dep and last_done > now: now = last_done
@@ -265,10 +313,12 @@ class Simulator:
                 now = min(done for _, done in inflight)
                 inflight = [item for item in outstanding if item[1] > now]
             nominal = before_stall + (gap + 1) / self.cfg.width
+            stall_since_l2 += max(0.0, now - nominal)
             before_l2 = self.counts["l2_accesses"]
-            latency = self._demand(pc, addr, bool(wr), now, max(0.0, now - nominal))
+            latency = self._demand(pc, addr, bool(wr), now, stall_since_l2)
+            if self.counts["l2_accesses"] != before_l2: stall_since_l2 = 0.0
             if (self.measure and self.counts["l2_accesses"] != before_l2
-                    and self.counts["l2_accesses"] % self.cfg.stats_interval == 0):
+                    and self.l2_idx % self.cfg.stats_interval == 0):
                 self._record_interval(inst, now)
             last_done = now + latency
             if latency > self.cfg.l1.latency:
@@ -279,7 +329,7 @@ class Simulator:
         if self.measure and self.counts["l2_accesses"] > self._interval_base["l2"]:
             self._record_interval(inst, now)
         unresolved = sum(info["measured"] and not info["resolved"] for info in self.book.values())
-        c = self.counts
+        c = self.counts; stats = self.prefetcher.stats()
         return SimulationResult(len(trace) - warmup, measured_inst, measured_cycles,
             measured_inst / measured_cycles if measured_cycles else 0.0,
             c["l2_accesses"], c["l2_misses"],
@@ -287,4 +337,6 @@ class Simulator:
             c["pollution"], c["pollution_benign"], c["useful_after_expiry"], c["late"],
             self.dram.reads["demand"] + self.dram.reads["prefetch"], self.dram.reads["demand"],
             self.dram.reads["prefetch"], min(1.0, self.dram.total_busy / measured_cycles) if measured_cycles else 0,
-            self.prefetcher.storage_bits(), c["returned"])
+            self.prefetcher.storage_bits(), c["returned"], float(stats.get("mean_reward", 0.0)),
+            list(stats.get("measured_action_counts", stats.get("action_counts", []))),
+            float(trace.meta.get("gap_mean", -1)))

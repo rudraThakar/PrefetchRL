@@ -32,7 +32,7 @@ class SimConfig:
     llc: CacheConfig = field(default_factory=lambda: CacheConfig(2048, 16, 34.0))
     dram_latency: float = 200.0
     peak_bw_gbps: float = 12.8
-    pf_backlog_factor: float = 4.0
+    pf_backlog_factor: float = 32.0
     bw_window_cycles: int = 4096
     bw_bucket_cycles: int = 64
     pf_same_page_only: bool = True
@@ -90,8 +90,29 @@ def load_agent_config(path: str | Path | None = None):
     with Path(path).open("r", encoding="utf-8") as handle:
         values = yaml.safe_load(handle) or {}
     values = dict(values)
+    if "reaches" in values and "low_accuracy_max_reach" not in values:
+        values["low_accuracy_max_reach"] = max(values["reaches"])
     if "reward" in values:
         values["reward"] = RewardConfig(**values["reward"])
-    for key in ("reaches", "patterns", "feature_drop"):
+    for key in ("reaches", "patterns", "feature_drop", "reset_boundaries"):
         if key in values: values[key] = tuple(values[key])
+    return AgentConfig(**values)
+
+
+def overlay_agent_config(base, path: str | Path):
+    """Apply a partial YAML variant to a complete agent configuration."""
+    from dataclasses import asdict
+    from pfsim.rl.agent import AgentConfig
+    from pfsim.rl.reward import RewardConfig
+    with Path(path).open("r", encoding="utf-8") as handle:
+        overlay = yaml.safe_load(handle) or {}
+    values = asdict(base)
+    reward = values.pop("reward")
+    reward.update(overlay.pop("reward", {}))
+    values.update(overlay)
+    if "reaches" in overlay and "low_accuracy_max_reach" not in overlay:
+        values["low_accuracy_max_reach"] = max(overlay["reaches"])
+    for key in ("reaches", "patterns", "feature_drop", "reset_boundaries"):
+        if key in values: values[key] = tuple(values[key])
+    values["reward"] = RewardConfig(**reward)
     return AgentConfig(**values)

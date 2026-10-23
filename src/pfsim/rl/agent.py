@@ -15,6 +15,7 @@ from .reward import RewardConfig, reward_for
 
 @dataclass
 class AgentConfig:
+    tuning_status: str = "provisional"
     alpha: float = .05
     gamma: float = .6
     eps_0: float = .12
@@ -29,11 +30,23 @@ class AgentConfig:
     explore_mode: str = "eps_decay"
     history_size: int = 8192
     reaches: tuple[int, ...] = (1, 2, 4, 8, 16)
-    patterns: tuple[str, ...] = ("P1", "P2", "P4", "M1", "PC_D1", "PC_D2", "PAGE_D1")
+    patterns: tuple[str, ...] = ("P1", "P2", "P4", "M1", "PC_D1", "PAGE_D1")
     feature_drop: tuple[str, ...] = ()
     reward_pollution: bool = True
     reward_bw_term: bool = True
     reward_graded: bool = True
+    admission_control: bool = False
+    admission_min_feedback: int = 4096
+    admission_min_accuracy: float = .15
+    admission_probe_interval: int = 64
+    bw_gate: bool = False
+    theta_bw: float = .75
+    theta_acc: float = .5
+    reach_control: bool = False
+    reach_min_feedback: int = 256
+    reach_min_accuracy: float = .5
+    low_accuracy_max_reach: int = 2
+    reset_boundaries: tuple[int, ...] = ()
     miss_lat_ref: float = 254.0
     reward: RewardConfig = field(default_factory=RewardConfig)
 
@@ -53,10 +66,20 @@ class _Decision:
 class RLPrefetcher:
     def __init__(self, config: AgentConfig | None = None):
         self.cfg = config or AgentConfig()
+        if self.cfg.admission_min_feedback < 0 or self.cfg.reach_min_feedback < 0:
+            raise ValueError("feedback thresholds must be non-negative")
+        if self.cfg.admission_probe_interval <= 0:
+            raise ValueError("admission_probe_interval must be positive")
+        if not 0 <= self.cfg.admission_min_accuracy <= 1 or not 0 <= self.cfg.reach_min_accuracy <= 1:
+            raise ValueError("accuracy thresholds must be between zero and one")
+        if self.cfg.low_accuracy_max_reach not in self.cfg.reaches:
+            raise ValueError("low_accuracy_max_reach must be one of the configured reaches")
         self._loaded_weights: tuple[list[np.ndarray], list[np.ndarray]] | None = None
+        self._loaded_steps = 0
         self.reset(0)
 
     def reset(self, seed: int) -> None:
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
         names = tuple(f"f{i}" for i in range(1, 7))
         unknown = set(self.cfg.feature_drop) - set(names)
@@ -79,8 +102,13 @@ class RLPrefetcher:
         self.pc_table: list[tuple[int, int, int, int, int] | None] = [None] * 1024
         self.page_table: list[tuple[int, int, int] | None] = [None] * 256
         self.decisions: dict[int, _Decision] = {}; self.order: deque[int] = deque()
-        self.previous: _Decision | None = None; self.next_id = self.steps = self.updates = 0
-        self.reward_sum = 0.0; self.action_counts = np.zeros(N_ACTIONS, dtype=np.int64)
+        self.previous: _Decision | None = None; self.next_id = self.updates = 0
+        self.steps = self._loaded_steps
+        self.reward_sum = 0.0; self.reward_count = 0
+        self.action_counts = np.zeros(N_ACTIONS, dtype=np.int64)
+        self.measured_action_counts = np.zeros(N_ACTIONS, dtype=np.int64); self.measure_actions = False
+        self.feedback_count = self.useful_feedback = 0
+        self.suppressed_count = self.reach_limited_count = 0
 
     def _history(self, ev: DemandEvent) -> History:
         ph = ((ev.pc >> 2) ^ (ev.pc >> 12)) & 1023
@@ -104,6 +132,10 @@ class RLPrefetcher:
         for table, row in zip(weights, state): value += table[row]
         return value
 
+    @staticmethod
+    def _q_action(weights, state, action):
+        return sum(float(table[row, action]) for table, row in zip(weights, state))
+
     def _epsilon(self):
         if self.cfg.explore_mode == "eps_fixed": return self.cfg.eps_min
         if self.cfg.explore_mode == "softmax": return 0.0
@@ -111,7 +143,10 @@ class RLPrefetcher:
 
     def _select(self, state, valid):
         candidates = np.flatnonzero(valid)
-        values = (self._q(self.weights_a, state) + self._q(self.weights_b, state)) / 2
+        values = np.zeros(N_ACTIONS, dtype=np.float32)
+        for table, row in zip(self.weights_a, state): values += table[row]
+        for table, row in zip(self.weights_b, state): values += table[row]
+        values *= .5
         if self.cfg.explore and self.cfg.explore_mode == "softmax":
             progress = min(1.0, self.steps / (2 * self.cfg.half_life))
             temperature = .5 + (.05 - .5) * progress
@@ -130,7 +165,7 @@ class RLPrefetcher:
         update_a = not self.cfg.double_q or bool(self.rng.integers(2))
         x = self.weights_a if update_a else self.weights_b
         y = self.weights_b if update_a else self.weights_a
-        current = float(self._q(x, decision.state)[decision.action])
+        current = self._q_action(x, decision.state, decision.action)
         if correction is not None:
             error = correction
         else:
@@ -139,7 +174,7 @@ class RLPrefetcher:
                 qx = self._q(x, decision.next_state)
                 choices = np.flatnonzero(decision.next_valid)
                 star = int(choices[np.argmax(qx[choices])])
-                target += self.cfg.gamma * float(self._q(y, decision.next_state)[star])
+                target += self.cfg.gamma * self._q_action(y, decision.next_state, star)
             error = target - current
         delta = float(np.clip(error, -self.cfg.delta_max, self.cfg.delta_max))
         count = len(self.active_features)
@@ -152,16 +187,48 @@ class RLPrefetcher:
                 and not decision.updated):
             self._update(decision); decision.updated = True
             self.reward_sum += decision.reward
+            self.reward_count += 1
 
     def on_demand(self, ev: DemandEvent):
+        if ev.l2_idx in self.cfg.reset_boundaries:
+            next_id = self.next_id
+            self._loaded_weights = None
+            self.reset(self.seed)
+            self.next_id = next_id  # never reuse tags still referenced by simulator outcomes
         history = self._history(ev)
         all_features = feature_indices(ev, history, self.cfg.pc_bits)
         state = tuple(all_features[i] for i in self.active_features)
         valid = valid_mask(ev.line, history, self.cfg.patterns, self.cfg.reaches)
+        if (self.cfg.reach_control
+                and self.feedback_count >= self.cfg.reach_min_feedback
+                and ev.sys.acc_ema < self.cfg.reach_min_accuracy):
+            for candidate in np.flatnonzero(valid):
+                if candidate and decode(int(candidate))[1] > self.cfg.low_accuracy_max_reach:
+                    valid[candidate] = False
+            self.reach_limited_count += 1
         if self.previous is not None:
             self.previous.next_state = state; self.previous.next_valid = valid
             self._finalize(self.previous)
-        action = self._select(state, valid); self.steps += 1; self.action_counts[action] += 1
+        action = self._select(state, valid)
+        # An accuracy floor is an admission safeguard, not a replacement for RL.
+        # Periodic probes let the policy recover when a workload changes phase.
+        threshold_block = (self.cfg.bw_gate and ev.sys.bw_util > self.cfg.theta_bw
+                           and ev.sys.acc_ema < self.cfg.theta_acc)
+        low_confidence = (threshold_block or (self.cfg.admission_control
+                          and self.feedback_count >= self.cfg.admission_min_feedback
+                          and ev.sys.acc_ema < self.cfg.admission_min_accuracy))
+        probe = (self.cfg.admission_probe_interval > 0
+                 and self.suppressed_count % self.cfg.admission_probe_interval == 0)
+        if threshold_block and action != 0:
+            action = 0
+            self.suppressed_count += 1
+        elif low_confidence and action != 0 and not probe:
+            action = 0
+            self.suppressed_count += 1
+        elif low_confidence and action != 0:
+            self.suppressed_count += 1
+        self.steps += 1; self.action_counts[action] += 1
+        if self.measure_actions: self.measured_action_counts[action] += 1
         decision = _Decision(self.next_id, state, action, valid); self.next_id += 1
         self.decisions[decision.ident] = decision; self.order.append(decision.ident)
         while len(self.order) > self.cfg.history_size:
@@ -181,6 +248,9 @@ class RLPrefetcher:
             if self.cfg.reward_pollution:
                 self._update(decision, -self.cfg.reward.c_pol)
         else:
+            if out.kind in (OutcomeKind.USEFUL, OutcomeKind.USELESS):
+                self.feedback_count += 1
+                self.useful_feedback += int(out.kind == OutcomeKind.USEFUL)
             reward_cfg = self.cfg.reward
             if not self.cfg.reward_bw_term or not self.cfg.reward_graded:
                 from dataclasses import replace
@@ -197,9 +267,20 @@ class RLPrefetcher:
         return weights + history
 
     def stats(self) -> dict[str, Any]:
-        return {"mean_reward": self.reward_sum / self.updates if self.updates else 0.0,
+        return {"mean_reward": self.reward_sum / self.reward_count if self.reward_count else 0.0,
+                "reward_sum": self.reward_sum, "reward_count": self.reward_count,
                 "epsilon": self._epsilon(), "updates": self.updates,
-                "action_counts": self.action_counts.tolist()}
+                "action_counts": self.action_counts.tolist(),
+                "measured_action_counts": self.measured_action_counts.tolist(),
+                "feedback_count": self.feedback_count,
+                "feedback_accuracy": (self.useful_feedback / self.feedback_count
+                                      if self.feedback_count else 0.0),
+                "suppressed_count": self.suppressed_count,
+                "reach_limited_count": self.reach_limited_count}
+
+    def start_measurement(self) -> None:
+        self.measured_action_counts.fill(0)
+        self.measure_actions = True
 
     def save(self, path: str | Path) -> None:
         path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,6 +288,7 @@ class RLPrefetcher:
         if self.cfg.double_q:
             arrays.update({f"b_{i}": value for i, value in enumerate(self.weights_b)})
         arrays["active_features"] = np.asarray(self.active_features, dtype=np.int16)
+        arrays["steps"] = np.asarray(self.steps, dtype=np.int64)
         np.savez_compressed(path, **arrays)
 
     def load(self, path: str | Path) -> None:
@@ -218,9 +300,11 @@ class RLPrefetcher:
             a = [data[f"a_{i}"].copy() for i in range(len(active))]
             b = ([data[f"b_{i}"].copy() for i in range(len(active))]
                  if self.cfg.double_q else a)
+            loaded_steps = int(data["steps"]) if "steps" in data else 0
         configured_rows = list(ROWS); configured_rows[2] = (1 << self.cfg.pc_bits) * 17
         expected_shapes = [(configured_rows[i], N_ACTIONS) for i in active]
         if [value.shape for value in a] != expected_shapes or [value.shape for value in b] != expected_shapes:
             raise ValueError("checkpoint weight shapes do not match configuration")
         self._loaded_weights = (a, b)
+        self._loaded_steps = loaded_steps
         self.reset(0)

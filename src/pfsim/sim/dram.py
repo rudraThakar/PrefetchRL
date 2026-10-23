@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import deque
+from bisect import bisect_right
 
 
 class DramChannel:
@@ -9,7 +9,8 @@ class DramChannel:
         self.transfer_cycles = transfer_cycles
         self.window_cycles = window_cycles
         self.channel_free = 0.0
-        self.requests: deque[tuple[float, float]] = deque()
+        self.starts: list[float] = []
+        self.ends: list[float] = []
         self.total_busy = 0.0
         self.reads = {"demand": 0, "prefetch": 0}
 
@@ -17,19 +18,17 @@ class DramChannel:
         start = max(arrival, self.channel_free)
         end = start + self.transfer_cycles
         self.channel_free = end
-        self.requests.append((start, end))
+        self.starts.append(start); self.ends.append(end)
         self.total_busy += self.transfer_cycles
         self.reads[kind] += 1
         return end + self.latency
 
     def utilization(self, now: float) -> float:
-        lower = now - self.window_cycles
-        while self.requests and self.requests[0][1] <= lower:
-            self.requests.popleft()
-        busy = 0.0
-        for start, end in self.requests:
-            if start >= now:
-                break
-            busy += max(0.0, min(end, now) - max(start, lower))
-        return min(1.0, busy / self.window_cycles)
-
+        def busy_before(moment: float) -> float:
+            completed = bisect_right(self.ends, moment)
+            busy = completed * self.transfer_cycles
+            if completed < len(self.starts) and self.starts[completed] < moment:
+                busy += min(moment, self.ends[completed]) - self.starts[completed]
+            return busy
+        busy = busy_before(now) - busy_before(now - self.window_cycles)
+        return min(1.0, max(0.0, busy / self.window_cycles))
