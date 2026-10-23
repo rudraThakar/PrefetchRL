@@ -1,0 +1,28 @@
+alpha: 0.05
+gamma: 0.6
+eps_0: 0.12
+eps_min: 0.01
+half_life: 150000
+q0: 0.2
+delta_max: 2.0
+pc_bits: 8
+double_q: true
+learn: true
+explore: true
+explore_mode: eps_decay
+history_size: 8192
+reaches: [1, 2, 4, 8, 16]
+patterns: [P1, P2, P4, M1, PC_D1, PC_D2, PAGE_D1]
+feature_drop: []
+reward_pollution: true
+reward_bw_term: true
+reward_graded: true
+reward:
+  c_use: 1.0
+  t_min: 0.2
+  c_w0: 0.3
+  c_w1: 1.0
+  c_red: 0.05
+  c_drop: 0.10
+  c_none_miss: 0.05
+  c_pol: 0.6
