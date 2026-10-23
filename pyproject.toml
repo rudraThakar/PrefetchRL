@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pfsim"
+version = "0.1.0"
+description = "Trace-driven simulator for reinforcement-learning memory prefetchers"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23", "pandas>=1.5", "matplotlib>=3.6", "PyYAML>=6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+pfsim = "pfsim.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["slow: expensive default-length acceptance checks"]
