@@ -2,8 +2,9 @@ from dataclasses import replace
 
 import numpy as np
 
-from pfsim.config import load_agent_config
+from pfsim.config import load_agent_config, overlay_agent_config
 from pfsim.rl import AgentConfig, QTableSmallPrefetcher, RLPrefetcher
+from pfsim.rl.reward import RewardConfig
 from pfsim.sim.events import DemandEvent, SysState
 
 
@@ -21,6 +22,16 @@ def test_load_agent_yaml_and_feature_ablation(tmp_path):
     assert cfg.alpha == .1 and cfg.reward.c_pol == .9
     assert agent.active_features == (0, 2, 3, 5)
     assert len(agent.weights_a) == 4
+
+
+def test_variant_overlay_preserves_tuned_fields(tmp_path):
+    base = AgentConfig(alpha=.0123, pc_bits=6, reward=RewardConfig(c_pol=.91))
+    path = tmp_path / "variant.yaml"
+    path.write_text("gamma: 0.0\nreward:\n  c_w0: 0.7\n", encoding="utf-8")
+    cfg = overlay_agent_config(base, path)
+    assert cfg.gamma == 0
+    assert cfg.alpha == .0123 and cfg.pc_bits == 6
+    assert cfg.reward.c_w0 == .7 and cfg.reward.c_pol == .91
 
 
 def test_checkpoint_survives_reset(tmp_path):
