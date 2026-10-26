@@ -215,6 +215,23 @@ def _evaluate_agent_candidate(args):
     return candidate_id,geometric_mean(grouped),candidate_rows
 
 
+def _evaluate_refine_candidate(args):
+    config, names, records, candidate, candidate_id = args
+    context = _TuningContext(config, records); speeds = []; candidate_rows = []
+    for workload, trace_seed, bandwidth in itertools.product(names, TUNING_TRACE_SEEDS, TUNING_BANDWIDTHS):
+        trace = context.trace(workload, trace_seed)
+        baseline = context.baseline(workload, trace_seed, bandwidth)
+        cfg = config.with_bandwidth(bandwidth)
+        for agent_seed in TUNING_AGENT_SEEDS:
+            run_cfg = replace(candidate, miss_lat_ref=cfg.llc.latency + cfg.dram_latency + cfg.transfer_cycles)
+            result = Simulator(cfg, RLPrefetcher(run_cfg)).run(trace, agent_seed)
+            speedup = result.ipc / baseline.ipc; speeds.append(speedup)
+            candidate_rows.append({"stage": "refine", "candidate": candidate_id, "workload": workload,
+                         "trace_seed": trace_seed, "agent_seed": agent_seed,
+                         "bw_gbps": bandwidth, "ipc": result.ipc, "speedup": speedup})
+    return candidate_id, geometric_mean(speeds), candidate_rows
+
+
 def tune_agent(config: SimConfig, *, workloads: Iterable[str] = DEV_WORKLOADS,
                records: int | None = 1_000_000, trials: int = 60, search_seed: int = 2026,
                refine: bool = True, refinement_records: int | None = None,
@@ -253,34 +270,27 @@ def tune_agent(config: SimConfig, *, workloads: Iterable[str] = DEV_WORKLOADS,
     if executor: executor.shutdown()
     scored.sort(key=lambda item: item[0], reverse=True)
     if refine:
-        refine_context = _TuningContext(config, refinement_records)
         completed_refine = _checkpoint_records(refine_checkpoint, resume)
         refined: list[tuple[float, int, AgentConfig]] = []
         finalists = scored[:min(5, len(scored))]; refine_started = time.perf_counter()
+        pending_refine = [(config, names, refinement_records, candidate, candidate_id)
+                          for _, candidate_id, candidate in finalists if candidate_id not in completed_refine]
+        refine_executor = (ProcessPoolExecutor(max_workers=min(jobs, len(pending_refine)))
+                           if jobs > 1 and len(pending_refine) > 1 else None)
+        fresh_refine = iter(refine_executor.map(_evaluate_refine_candidate, pending_refine) if refine_executor
+                            else map(_evaluate_refine_candidate, pending_refine))
         for finalist_index, (_, candidate_id, candidate) in enumerate(finalists):
             if candidate_id in completed_refine:
                 record = completed_refine[candidate_id]; rows.extend(record["rows"])
                 refined.append((float(record["score"]), candidate_id, candidate))
                 _progress("agent refine", finalist_index + 1, len(finalists), refine_started, progress)
                 continue
-            speeds = []
-            candidate_rows = []
-            for workload, trace_seed, bandwidth in itertools.product(names, TUNING_TRACE_SEEDS, TUNING_BANDWIDTHS):
-                trace = refine_context.trace(workload, trace_seed)
-                baseline = refine_context.baseline(workload, trace_seed, bandwidth)
-                cfg = config.with_bandwidth(bandwidth)
-                for agent_seed in TUNING_AGENT_SEEDS:
-                    run_cfg = replace(candidate, miss_lat_ref=cfg.llc.latency + cfg.dram_latency + cfg.transfer_cycles)
-                    result = Simulator(cfg, RLPrefetcher(run_cfg)).run(trace, agent_seed)
-                    speedup = result.ipc / baseline.ipc; speeds.append(speedup)
-                    candidate_rows.append({"stage": "refine", "candidate": candidate_id, "workload": workload,
-                                 "trace_seed": trace_seed, "agent_seed": agent_seed,
-                                 "bw_gbps": bandwidth, "ipc": result.ipc, "speedup": speedup})
-            score = geometric_mean(speeds); rows.extend(candidate_rows)
+            _, score, candidate_rows = next(fresh_refine); rows.extend(candidate_rows)
             refined.append((score, candidate_id, candidate))
             _checkpoint_append(refine_checkpoint, {"candidate": candidate_id, "score": score,
                                                     "rows": candidate_rows})
             _progress("agent refine", finalist_index + 1, len(finalists), refine_started, progress)
+        if refine_executor: refine_executor.shutdown()
         refined.sort(key=lambda item: item[0], reverse=True); best_score, _, best = refined[0]
     else:
         best_score, _, best = scored[0]

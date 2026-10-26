@@ -1,3 +1,3 @@
-tuning_status: provisional
-records: 10000
-note: smoke-search artifact; overwrite only with the full baseline campaign
+tuning_status: full
+records: 1000000
+code_hash: f06a9fa33e3f
