@@ -1,0 +1,4 @@
+variant,workloads,speedup_gmean
+cold,6,1.1126455366528707
+warm_learning,6,1.0990891705455739
+warm_frozen,6,1.0390401020700433

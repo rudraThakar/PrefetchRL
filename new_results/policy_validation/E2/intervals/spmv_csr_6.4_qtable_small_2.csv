@@ -1,0 +1,2 @@
+l2_idx,l2_accesses,window_ipc,window_accuracy,window_coverage_proxy,mean_reward,epsilon
+38180,34359,0.3761185102287911,0.7118460287340743,0.15285660234581913,0.0020218688693112367,0.01
