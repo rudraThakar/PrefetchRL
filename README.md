@@ -2,7 +2,13 @@
 
 `pfsim` is a deterministic, trace-driven single-core memory-system simulator for evaluating conventional and reinforcement-learning prefetchers. This repository is being built from the accompanying implementation specification.
 
-Current status: the package scaffold, generated workload streams, cache/DRAM/core simulator, outcome and interval accounting, conventional and future-lookahead baselines, comparative metrics, online double-Q agent, `qtable_small`, checkpoint persistence, resumable/parallel tuning, E1–E8, E10–E12, and S1 runners are implemented. The main tuner searches only learned-policy parameters; hand-written admission/reach controls are disabled. The full tuning campaign has not yet been executed, and existing tuned values/results are provisional artifacts.
+Current status: the simulator, conventional and future-lookahead baselines, online double-Q agent, checkpoint persistence, tuning pipeline, and E1–E8/E10–E12/S1 runners are implemented. The full 60-candidate M8 campaign and five-candidate refinement are complete, and the frozen agent and baseline configurations are marked `full`. The authoritative full-seed E1 is under `results/final/E1`; the remote extended E2–E12 suite is archived under `final_results/results`. The submission-ready analysis is in [FINAL_REPORT.md](FINAL_REPORT.md).
+
+## Final headline result
+
+The definitive E1 evaluation contains 585 million-record simulations across 13 workloads, three trace seeds, and five learned-policy seeds. The final RL prefetcher achieves **1.1909x geomean performance (19.09% over no prefetching)** with a 95% bootstrap interval of **[1.1864x, 1.1950x]**. It is 12.09% faster than next-line, 4.24% faster than BOP, and 4.35% faster than the compact Q-table policy. The tuned PC-stride baseline remains 6.13% faster overall, so the project claims useful adaptive performance rather than universal dominance.
+
+On held-out workloads, the agent retains **1.1137x** geomean performance and is close to the strongest held-out aggregate, next-line at 1.1176x. The complete remote E2–E12 suite is archived under `final_results/`; it includes million-record bandwidth and ablation studies, transfer, storage, action, headroom, phase-adaptation, controller, and sensitivity analyses. See [FINAL_REPORT.md](FINAL_REPORT.md) for the provenance audit, tables, limitations, and conclusions.
 
 ## Setup
 
@@ -30,7 +36,7 @@ pfsim run --trace traces/stride_const_s0.npz --prefetcher agent \
 Run a small E1 smoke experiment:
 
 ```bash
-pfsim experiment E1 --budget quick --records 10000 --workload seq_stream --allow-provisional --force
+pfsim experiment E1 --budget quick --records 10000 --workload seq_stream --force
 ```
 
 Omit `--records` and `--workload` for the specified one-million-record quick budget across all workloads. E1 writes `runs.csv`, `summary.csv`, and interval CSV files under `results/E1/`.
@@ -57,7 +63,7 @@ Use `--force` to start a fresh search and `--resume` to continue one; they canno
 
 Agent tuning uses only the seven development workloads, trace seeds 100/101, and agent seeds 100/101/102. Test workloads are rejected by the tuning API and CLI. For a pipeline smoke test, reduce `--records`, `--trials`, add one or more development `--workload` arguments, and use `--no-refine`; do not treat that output as a tuned production configuration.
 
-After code freeze, the final campaign is:
+The completed full tuning campaign is reproducible with:
 
 ```bash
 pfsim tune --target baselines --records 1000000 --force
@@ -65,6 +71,14 @@ pfsim tune --target agent --records 1000000 --refinement-records 1000000 --trial
 ```
 
 Both searches write per-candidate checkpoints. Replace `--force` with `--resume` after an interruption. Commit the resulting `configs/baselines_tuned.yaml` and `configs/agent_tuned.yaml` before running held-out evaluation.
+
+The primary final evaluation command is:
+
+```bash
+pfsim experiment E1 --budget full --records 1000000 --out results/final --force
+```
+
+E1 is deterministic per seed and workload, so workloads may be sharded across independent processes and their raw rows merged without changing the experimental population. The submitted result contains exactly 585 unique runs.
 
 Bandwidth and ablation experiments are available as:
 
@@ -91,6 +105,12 @@ pfsim experiment E12 --allow-provisional --force
 
 The CLI refuses to overwrite traces and results unless `--force` is supplied. Runs print their configuration hash and Git commit.
 
+Generate an index of completed result sets with:
+
+```bash
+pfsim report --results results/final --out results/final/REPORT.md --force
+```
+
 ## Scope of conclusions
 
-The project currently follows data-strategy Option A. Results will describe the specified synthetic and kernel pattern classes only; they will not claim generalization to real software.
+The project follows data-strategy Option A. Results describe the specified synthetic and kernel pattern classes only; they do not claim generalization to real software. The locally merged E1 is the definitive full-seed result. Remote E2–E12 provide the extended analysis; experiments with dirty Git provenance are identified as supplementary in the final report rather than silently treated as clean-freeze evidence.
