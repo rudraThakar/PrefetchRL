@@ -278,4 +278,4 @@ Results describe the provided synthetic and kernel-pattern traces. They do not e
 
 ## Citation
 
-If this repository is used in a report or demonstration, cite the repository URL and the included technical report. Add team names and the final GitHub link here before submission.
+If this repository is used in a report or demonstration, cite the repository URL and the included technical report. 
