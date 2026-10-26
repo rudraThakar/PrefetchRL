@@ -14,7 +14,7 @@ The definitive E1 evaluation contains 585 million-record simulations across 13 w
 - 4.24% improvement over BOP; and
 - 4.35% improvement over the compact Q-table agent.
 
-The tuned PC-stride baseline remains 6.13% faster overall. The project therefore demonstrates useful adaptive RL behavior rather than claiming universal superiority. See [FINAL_REPORT.md](FINAL_REPORT.md) for E1 through E12 analysis, limitations, and conclusions.
+The tuned PC-stride baseline remains 6.13% faster overall. The project therefore demonstrates useful adaptive RL behavior rather than claiming universal superiority. 
 
 ## RL agent
 
@@ -26,9 +26,8 @@ The trained deliverables are:
 
 - [`configs/agent_tuned.yaml`](configs/agent_tuned.yaml): frozen full-tuning agent and reward configuration;
 - [`configs/baselines_tuned.yaml`](configs/baselines_tuned.yaml): frozen baseline parameters;
-- `final_results/results/tune/`: complete search and refinement records;
-- `final_results/results/E5/pretrained_weights.npz`: experimental transferable Q-table checkpoint; and
-- `final_results/configs/`: configuration snapshot archived with the remote results.
+- `new_results/results/tune/`: complete search and refinement records;
+
 
 The primary agent is intentionally an online learner. It starts from the tuned optimistic initialization and adapts during each workload. The E5 checkpoint is provided for checkpoint reproduction, but it is not the default policy because the transfer experiment found that cold online learning performed better.
 
@@ -38,9 +37,8 @@ The primary agent is intentionally an online learner. It starts from the tuned o
 configs/                 Frozen simulator, RL-agent, baseline, and ablation configs
 src/pfsim/               Simulator, RL agent, prefetchers, CLI, tuning, experiments
 tests/                    Unit, accounting, behavior, CLI, and experiment tests
-final_results/            Archived remote tuning and E1 to E12 result suite
+new_results/            Archived remote tuning and E1 to E12 result suite
 report/                   Two-column LaTeX assignment report and figure
-FINAL_REPORT.md           Full technical analysis and conclusions
 pyproject.toml            Package metadata, dependencies, and CLI entry point
 ```
 
